@@ -1,10 +1,15 @@
 import * as net from 'net';
 import * as dgram from 'dgram';
+import * as dns from 'dns';
 import * as fs from 'fs';
 import * as ini from 'ini';
 
 const INI_FILE_PATH = './resources/settings.ini';
-const AWS_SERVER_IP = '3.101.83.235';
+// NOTE: these feed servers (sactoatcs.dyndns.org and friends) run on
+// volunteers' home connections behind DynDNS. Their IP changes whenever the
+// operator's ISP reassigns them a new address, so we must never hardcode an
+// IP for them -- always resolve the hostname fresh, and always subscribe to
+// whichever host actually answered the TCP handshake.
 const PRIMARY_SERVER = 'www.atcsmon.com';
 const PRIMARY_PORT = 4830;
 const FALLBACK_SERVER = 'sactoatcs.dyndns.org';
@@ -182,29 +187,69 @@ function logPacket(protocol: string, source: string, data: Buffer): void {
 const udpPorts: number[] = [];
 const udpSockets: dgram.Socket[] = [];
 
-// Function to create UDP socket for a given port
-function createUdpSocket(port: number) {
-  if (udpPorts.includes(port)) return; // Avoid duplicate sockets
-  udpPorts.push(port);
+// Function to create UDP socket for a given (local bind port, remote server port) pair.
+// `targetHost` is the hostname that just answered us via TCP -- we resolve
+// it ourselves, right before sending, instead of trusting a cached/hardcoded
+// IP that may be stale (see note on FALLBACK_SERVER above).
+//
+// IMPORTANT: `localPort` and `remotePort` are NOT the same number, and must
+// not be conflated (this was the bug). Per the Wireshark capture, the real
+// app subscribes to UDP data from the SAME local port its TCP connection to
+// that server used (e.g. TCP src port 49657 -> UDP src port 49657), and
+// sends that subscription TO the port number the server announced over TCP
+// (e.g. UDP dst port 16050). The server then replies to whatever source
+// port the subscription arrived FROM -- ordinary UDP request/reply
+// behavior -- which is the TCP-derived local port, not the announced one.
+// Binding locally to the announced port instead (the old code) put the
+// subscription's source port on 16050, so replies -- sent by the server
+// back to the client's real TCP-connection local port -- landed on a port
+// nothing was listening on and were silently dropped.
+function createUdpSocket(localPort: number, remotePort: number, targetHost: string) {
+  if (udpPorts.includes(localPort)) return; // Avoid duplicate sockets
+  udpPorts.push(localPort);
   const udpSocket = dgram.createSocket({ type: 'udp4', reuseAddr: true });
   udpSocket.on('listening', () => {
-    console.log(`UDP Socket bound to port ${port} for broadcasts`);
+    console.log(`UDP Socket bound to port ${localPort} for broadcasts`);
   });
   udpSocket.on('message', (msg: Buffer, rinfo) => {
-    
+    // The server periodically pings with a plaintext "*KEEPALIVE" datagram
+    // (first byte 0x2a, doesn't match either protocolByte case in
+    // processPacket). Per the reference capture, the real app must echo the
+    // subscription payload straight back in response -- the very first
+    // KEEPALIVE reply is what promotes the connection from "subscribed" to
+    // actually streaming indication data; without answering it, the server
+    // just sits idle and eventually tears down the TCP side. Later
+    // KEEPALIVEs during an active stream get the same echo.
+    if (msg.toString('ascii') === '*KEEPALIVE') {
+      udpSocket.send(SUBSCRIPTION_PAYLOAD, rinfo.port, rinfo.address, (err) => {
+        if (err) console.error(`UDP Keepalive Ack Error to ${rinfo.address}:${rinfo.port}: ${err.message}`);
+        else console.log(`Received KEEPALIVE from ${rinfo.address}:${rinfo.port}, echoed subscription`);
+      });
+      return;
+    }
+
     if (processPacket(msg)) {
       logPacket('UDP', `${rinfo.address}:${rinfo.port}`, msg);
       console.log("-------------------------------");
     }
   });
   udpSocket.on('error', (err) => {
-    console.error(`UDP Error on port ${port}: ${err.message}`);
+    console.error(`UDP Error on port ${localPort}: ${err.message}`);
   });
-  udpSocket.bind(port, '0.0.0.0', () => {
+  udpSocket.bind(localPort, '0.0.0.0', () => {
     udpSocket.setBroadcast(true);
-    udpSocket.send(SUBSCRIPTION_PAYLOAD, port, AWS_SERVER_IP, (err) => {
-      if (err) console.error(`UDP Send Error to ${AWS_SERVER_IP}:${port}: ${err.message}`);
-      else console.log(`Sent UDP subscription to ${AWS_SERVER_IP}:${port}: ${SUBSCRIPTION_PAYLOAD.toString('hex')}`);
+    // Resolve targetHost fresh every time -- for a DynDNS name the
+    // underlying IP can rotate between sessions (or even during one).
+    dns.lookup(targetHost, (lookupErr, resolvedIp) => {
+      if (lookupErr) {
+        console.error(`DNS lookup failed for ${targetHost}: ${lookupErr.message}`);
+        return;
+      }
+      console.log(`Resolved ${targetHost} -> ${resolvedIp} for UDP subscription`);
+      udpSocket.send(SUBSCRIPTION_PAYLOAD, remotePort, resolvedIp, (err) => {
+        if (err) console.error(`UDP Send Error to ${resolvedIp}:${remotePort}: ${err.message}`);
+        else console.log(`Sent UDP subscription from local port ${localPort} to ${resolvedIp}:${remotePort}: ${SUBSCRIPTION_PAYLOAD.toString('hex')}`);
+      });
     });
   });
   udpSockets.push(udpSocket);
@@ -224,9 +269,22 @@ function createTcpConnection(address: string, port: number) {
     if (portMatch) {
       const newPort = parseInt(portMatch[0]);
       console.log(`Detected UDP port ${newPort} from ${address}:${port}`);
-      createUdpSocket(newPort);
-      // Connect to sactoatcs.dyndns.org on the received port
-      createTcpConnection(FALLBACK_SERVER, newPort);
+      // Subscribe with the SAME host that handed us this port -- `address`
+      // is whichever hostname (www.atcsmon.com or an INI server such as
+      // sactoatcs.dyndns.org) actually answered this TCP connection.
+      // Bind the UDP socket to tcpClient.localPort (this connection's own
+      // ephemeral local port), NOT to newPort -- see the comment on
+      // createUdpSocket for why.
+      if (tcpClient.localPort) {
+        createUdpSocket(tcpClient.localPort, newPort, address);
+      } else {
+        console.error(`No local port available on TCP socket for ${address}:${port}, cannot subscribe to UDP ${newPort}`);
+      }
+      // Previously this also opened a second TCP connection to
+      // FALLBACK_SERVER on `newPort`, treating the UDP port number as a TCP
+      // port on the same host. That's not part of the protocol -- newPort is
+      // only for local UDP binding -- and it's what produced the
+      // `ETIMEDOUT ...:16072` / `...:16051` errors in your log. Removed.
     }
   });
 
