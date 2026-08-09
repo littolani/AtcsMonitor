@@ -1,0 +1,16 @@
+// tsconfig.json
+{
+  "compilerOptions": {
+    "target": "ES2020",              // Or higher, depending on your needs
+    "module": "CommonJS",            // Or "ESNext" if using ES modules
+    "rootDir": "src",                // Source directory
+    "outDir": "dist",                // Output directory
+    "strict": true,                  // Enable strict type checking
+    "esModuleInterop": true,         // Allow default imports from CommonJS
+    "forceConsistentCasingInFileNames": true,
+    "moduleResolution": "node",
+    "skipLibCheck": true,
+    "types": ["node"]
+  },
+  "include": ["src"]
+}
